@@ -45,10 +45,43 @@ limitations under the License.
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/tracing.h"
 #include "tensorflow/core/protobuf/worker.pb.h"
+#include "re2/re2.h"
+#include <chrono>
+#include <thread>
+#include <iostream>
+#include <vector>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <fstream>
 
 namespace tensorflow {
 
 namespace {
+
+std::unordered_map<std::string, int> __rpc_list = {};
+
+void __load_rpc_list() {
+  char* rpc_list_file_name_ = std::getenv("RPC_LIST_FILE");
+  if (rpc_list_file_name_ == nullptr) {
+    LOG(ERROR) << "RPC_LIST_FILE is not set.";
+    return;
+  }
+
+  LOG(WARNING) << "Loading RPC_LIST_FILE=" << rpc_list_file_name_;
+
+  std::ifstream infile(rpc_list_file_name_);
+
+  while (!infile.eof()) {
+    std::string name;
+    int order;
+    infile >> name >> order;
+    if (name != "") {
+      __rpc_list.insert({name, order});
+    }
+  }
+  LOG(WARNING) << "Loaded " << __rpc_list.size() << " items in RPC_LIST";
+}
 
 class GrpcWorkerService : public AsyncServiceInterface {
   // TODO(ncteisen): consider adding a config var or flag for this
@@ -57,6 +90,7 @@ class GrpcWorkerService : public AsyncServiceInterface {
  public:
   GrpcWorkerService(GrpcWorker* worker, ::grpc::ServerBuilder* builder)
       : is_shutdown_(false) {
+    __load_rpc_list();
     builder->RegisterService(&worker_service_);
     for (int i = 0; i < kGrpcWorkerServiceThreadCount; i++) {
       threads_.emplace_back(
@@ -392,7 +426,7 @@ void GrpcWorker::GrpcRecvTensorAsync(CallOptions* opts,
   opts->SetCancelCallback([this, step_id]() { AbortStep(step_id); });
   env_->rendezvous_mgr->RecvLocalAsync(
       step_id, parsed,
-      [opts, response, done, src_dev](const Status& status,
+      [this, opts, response, done, src_dev, step_id, parsed](const Status& status,
                                       const Rendezvous::Args& send_args,
                                       const Rendezvous::Args& recv_args,
                                       const Tensor& val, const bool is_dead) {
@@ -433,6 +467,32 @@ void GrpcWorker::GrpcRecvTensorAsync(CallOptions* opts,
               done(errors::Internal("No GPU device in process"));
 #endif  // GOOGLE_CUDA
             } else {
+              string rpc_name;
+              RE2::FullMatch(parsed.edge_name.ToString(), "edge_\\d+_(.+)/read",
+                             &rpc_name);
+              if (__rpc_list.count(rpc_name) > 0) {
+                const auto key = std::to_string(step_id) + "|" +
+                                 parsed.dst_device.ToString();
+                const auto rpc_order = __rpc_list[rpc_name];
+
+                std::unique_lock<std::mutex> channel_lock(xmu_);
+                auto& channel = channels[key];
+                channel_lock.unlock();
+                {
+                  std::unique_lock<std::mutex> lock(*channel.xmu_);
+                  int current_count = channel.counter;
+
+                  channel.xcv_->wait(lock, [rpc_order, &channel]() {
+                    return channel.counter >= rpc_order;
+                  });
+                  LOG(WARNING) << "MATCHED! " << rpc_name << "(" << rpc_order
+                               << "/" << current_count << "->"
+                               << channel.counter << ") @" << key;
+                  channel.counter += 1;
+                  channel.xcv_->notify_all();
+                }
+              }
+
               grpc::EncodeTensorToByteBuffer(is_dead, val, response);
               done(Status::OK());
             }

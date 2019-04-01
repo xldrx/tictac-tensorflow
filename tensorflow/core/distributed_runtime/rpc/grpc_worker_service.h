@@ -18,6 +18,8 @@ limitations under the License.
 
 #include "tensorflow/core/distributed_runtime/recent_request_ids.h"
 #include "tensorflow/core/distributed_runtime/worker.h"
+#include <mutex>
+#include <condition_variable>
 
 namespace grpc {
 class ByteBuffer;
@@ -47,6 +49,19 @@ class GrpcWorker : public Worker {
 
  private:
   RecentRequestIds recv_tensor_recent_request_ids_;
+  std::mutex xmu_;
+  struct OrderedChannel {
+    std::unique_ptr<std::mutex> xmu_;
+    std::unique_ptr<std::condition_variable> xcv_;
+    volatile int counter;
+    OrderedChannel()
+        : counter(0),
+          xmu_(new std::mutex()),
+          xcv_(new std::condition_variable()) {}
+    OrderedChannel(OrderedChannel&&) = default;
+    OrderedChannel(const OrderedChannel&) = delete;
+  };
+  std::unordered_map<string, OrderedChannel> channels;
 };
 
 std::unique_ptr<GrpcWorker> NewGrpcWorker(WorkerEnv* worker_env);
